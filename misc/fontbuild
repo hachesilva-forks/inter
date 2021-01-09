@@ -1,40 +1,33 @@
 #!/usr/bin/env python
 from __future__ import print_function, absolute_import
-
-import sys, os
+import sys
+import os
 from os.path import dirname, basename, abspath, relpath, join as pjoin
 sys.path.append(abspath(pjoin(dirname(__file__), 'tools')))
-from common import BASEDIR, VENVDIR, getGitHash, getVersion, execproc
+from common import BASEDIR, execproc
+from collections import OrderedDict
 
 import argparse
-import datetime
-import errno
 import glyphsLib
 import logging
 import re
 import signal
 import subprocess
-import ufo2ft
-from functools import partial
-from fontmake.font_project import FontProject
-from defcon import Font
-from fontTools import designspaceLib
-from fontTools import varLib
-from fontTools.misc.transform import Transform
-from fontTools.pens.transformPen import TransformPen
-from fontTools.pens.reverseContourPen import ReverseContourPen
-from glyphsLib.interpolation import apply_instance_data
+
+from fontTools.designspaceLib import DesignSpaceDocument
 from mutatorMath.ufo.document import DesignSpaceDocumentReader
 from multiprocessing import Process, Queue
-from ufo2ft.filters.removeOverlaps import RemoveOverlapsFilter
-from ufo2ft import CFFOptimization
+from glyphsLib.interpolation import apply_instance_data
+
+from fontbuildlib import FontBuilder
+from fontbuildlib.util import mkdirs, loadTTFont
+from fontbuildlib.info import setFontInfo
+from fontbuildlib.name import setFamilyName, renameStylesGoogleFonts
 
 log = logging.getLogger(__name__)
-stripItalic_re = re.compile(r'(?:^|\b)italic(?:\b|$)', re.I | re.U)
 
-
-def stripItalic(name):
-  return stripItalic_re.sub('', name.strip())
+# set to true to exclude anchors from .glyphs when generating UFOs
+EXCLUDE_ANCHORS = False
 
 
 def sighandler(signum, frame):
@@ -43,267 +36,16 @@ def sighandler(signum, frame):
   sys.exit(1)
 
 
-def mkdirs(path):
-  try:
-    os.makedirs(path)
-  except OSError as e:
-    if e.errno != errno.EEXIST:
-      raise  # raises the error again
-
-
 def fatal(msg):
   print(sys.argv[0] + ': ' + msg, file=sys.stderr)
   sys.exit(1)
 
 
-
-def composedGlyphIsNonTrivial(g, yAxisIsNonTrivial=False):
-  # A non-trivial glyph is one that is composed from either multiple
-  # components or that uses component transformations.
-  # If yAxisIsNonTrivial is true, then any transformation over the Y axis
-  # is be considered non-trivial.
-  if g.components and len(g.components) > 0:
-    if len(g.components) > 1:
-      return True
-    for c in g.components:
-      # has non-trivial transformation? (i.e. scaled)
-      # Example of optimally trivial transformation:
-      #   (1, 0, 0, 1, 0, 0)  no scale or offset
-      # Example of scaled transformation matrix:
-      #   (-1.0, 0, 0.3311, 1, 1464.0, 0)  flipped x axis, sheered and offset
-      # 
-      xScale, xyScale, yxScale, yScale, xOffset, yOffset = c.transformation
-      if xScale != 1 or xyScale != 0 or yxScale != 0 or yScale != 1:
-        return True
-      if yAxisIsNonTrivial and yOffset != 0:
-        return True
-  return False
-
-
-# Directives are glyph-specific post-processing directives for the compiler.
-# A directive is added to the "note" section of a glyph and takes the
-# following form:
-#
-#   !post:DIRECTIVE
-#
-# Where DIRECTIVE is the name of a known directive.
-# This string can appear anywhere in the glyph note.
-# Directives are _not_ case sensitive but normalized by str.lower(), meaning
-# that e.g. "removeoverlap" == "RemoveOverlap" == "REMOVEOVERLAP".
-#
-knownDirectives = set([
-  'removeoverlap',  # applies overlap removal (boolean union)
-])
-
-
-findDirectiveRegEx = re.compile(r'\!post:([^ ]+)', re.I | re.U)
-
-def findGlyphDirectives(g): # -> set<string> | None
-  directives = set()
-  if g.note and len(g.note) > 0:
-    for directive in findDirectiveRegEx.findall(g.note):
-      directive = directive.lower()
-      if directive in knownDirectives:
-        directives.add(directive)
-      else:
-        print(
-          'unknown glyph directive !post:%s in glyph %s' % (directive, g.name),
-          file=sys.stderr
-        )
-  return directives
-
-
-class VarFontProject(FontProject):
-  def decompose_glyphs(self, designspace, glyph_filter=lambda g: True):
-    """Move components of UFOs' glyphs to their outlines."""
-    for ufo in designspace:
-      log.info('Decomposing glyphs for ' + self._font_name(ufo))
-      for glyph in ufo:
-        if not glyph.components or not glyph_filter(glyph):
-          continue
-        self._deep_copy_contours(ufo, glyph, glyph, Transform())
-        glyph.clearComponents()
-
-  def _deep_copy_contours(self, ufo, parent, component, transformation):
-    """Copy contours from component to parent, including nested components."""
-    for nested in component.components:
-      self._deep_copy_contours(
-        ufo, parent, ufo[nested.baseGlyph],
-        transformation.transform(nested.transformation))
-    if component != parent:
-      pen = TransformPen(parent.getPen(), transformation)
-      # if the transformation has a negative determinant, it will reverse
-      # the contour direction of the component
-      xx, xy, yx, yy = transformation[:4]
-      if xx*yy - xy*yx < 0:
-        pen = ReverseContourPen(pen)
-      component.draw(pen)
-
-
-  def _build_interpolatable_masters(
-    self,
-    designspace,
-    ttf,
-    use_production_names=None,
-    reverse_direction=True,
-    conversion_error=None,
-    feature_writers=None,
-    cff_round_tolerance=None,
-    **kwargs
-  ):
-    """Build OpenType binaries with interpolatable outlines."""
-    # We decompose any glyph with two or more components to make sure
-    # that fontTools varLib is able to produce properly-slanting interpolation.
-
-    self._load_designspace_sources(designspace)
-
-    decomposeGlyphs = set()
-    removeOverlapsGlyphs = set()
-    masters = [s.font for s in designspace.sources]
-
-    for ufo in masters:
-      updateFontVersion(ufo)
-      isItalic = ufo.info.italicAngle != 0
-      ufoname = basename(ufo.path)
-      for g in ufo:
-        directives = findGlyphDirectives(g)
-        if g.components and composedGlyphIsNonTrivial(g, yAxisIsNonTrivial=isItalic):
-          decomposeGlyphs.add(g.name)
-        if 'removeoverlap' in directives:
-          if g.components and len(g.components) > 0:
-            decomposeGlyphs.add(g.name)
-          removeOverlapsGlyphs.add(g)
-
-    self.decompose_glyphs(masters, lambda g: g.name in decomposeGlyphs)
-
-    if len(removeOverlapsGlyphs) > 0:
-      rmoverlapFilter = RemoveOverlapsFilter(backend='pathops')
-      rmoverlapFilter.start()
-      for g in removeOverlapsGlyphs:
-        log.info(
-          'Removing overlaps in glyph "%s" of %s',
-          g.name,
-          basename(g.getParent().path)
-        )
-        rmoverlapFilter.filter(g)
-
-    if ttf:
-      return ufo2ft.compileInterpolatableTTFsFromDS(
-        designspace,
-        useProductionNames=use_production_names,
-        reverseDirection=reverse_direction,
-        cubicConversionError=conversion_error,
-        featureWriters=feature_writers,
-        inplace=True,
-      )
-    else:
-      return ufo2ft.compileInterpolatableOTFsFromDS(
-        designspace,
-        useProductionNames=use_production_names,
-        roundTolerance=cff_round_tolerance,
-        featureWriters=feature_writers,
-        inplace=True,
-      )
-
-
-def updateFontVersion(font, dummy=False):
-  version = getVersion()
-  buildtag = getGitHash()
-  now = datetime.datetime.utcnow()
-  if dummy:
-    version = "1.0"
-    buildtag = "src"
-    now = datetime.datetime(2016, 1, 1, 0, 0, 0, 0)
-  versionMajor, versionMinor = [int(num) for num in version.split(".")]
-  font.info.version = version
-  font.info.versionMajor = versionMajor
-  font.info.versionMinor = versionMinor
-  font.info.woffMajorVersion = versionMajor
-  font.info.woffMinorVersion = versionMinor
-  font.info.year = now.year
-  font.info.openTypeNameVersion = "%s;%s" % (version, buildtag)
-  font.info.openTypeNameUniqueID = "%s %s:%d:%s" % (
-    font.info.familyName, font.info.styleName, now.year, buildtag)
-  # creation date & time (YYYY/MM/DD HH:MM:SS)
-  font.info.openTypeHeadCreated = now.strftime("%Y/%m/%d %H:%M:%S")
-
-
-# setFontInfo patches font.info
-# 
-def setFontInfo(font, weight):
-  #
-  # For UFO3 names, see
-  # https://github.com/unified-font-object/ufo-spec/blob/gh-pages/versions/
-  #   ufo3/fontinfo.plist.md
-  # For OpenType NAME table IDs, see
-  # https://docs.microsoft.com/en-us/typography/opentype/spec/name#name-ids
-
-  # Add " BETA" to light weights
-  if weight < 400:
-    font.info.styleName = font.info.styleName + " BETA"
-
-  family = font.info.familyName  # i.e. "Inter"
-  style = font.info.styleName    # e.g. "Medium Italic"
-
-  # Update italicAngle
-  isitalic = False
-  if font.info.italicAngle != 0:
-    isitalic = True
-    font.info.italicAngle = float('%.8g' % font.info.italicAngle)
-  else:
-    font.info.italicAngle = 0  # avoid "-0.0" value in UFO
-
-  # weight
-  font.info.openTypeOS2WeightClass = weight
-
-  # version (dummy)
-  updateFontVersion(font, dummy=True)
-
-  # Names
-  family_nosp = re.sub(r'\s', '', family)
-  style_nosp = re.sub(r'\s', '', style)
-  font.info.macintoshFONDName = "%s %s" % (family_nosp, style_nosp)
-  font.info.postscriptFontName = "%s-%s" % (family_nosp, style_nosp)
-
-  # name ID 16 "Typographic Family name"
-  font.info.openTypeNamePreferredFamilyName = family
-
-  # name ID 17 "Typographic Subfamily name"
-  font.info.openTypeNamePreferredSubfamilyName = style
-
-  # name ID 1 "Family name" (legacy, but required)
-  # Restriction:
-  #   "shared among at most four fonts that differ only in weight or style"
-  # So we map as follows:
-  # - Regular => "Family", ("regular" | "italic" | "bold" | "bold italic")
-  # - Medium  => "Family Medium", ("regular" | "italic")
-  # - Black   => "Family Black", ("regular" | "italic")
-  # and so on.
-  subfamily = stripItalic(style).strip() # "A Italic" => "A", "A" => "A"
-  if len(subfamily) == 0:
-    subfamily = "Regular"
-  subfamily_lc = subfamily.lower()
-  if subfamily_lc == "regular" or subfamily_lc == "bold":
-    font.info.styleMapFamilyName = family
-    # name ID 2 "Subfamily name" (legacy, but required)
-    # Value must be one of: "regular", "italic", "bold", "bold italic"
-    if subfamily_lc == "regular":
-      if isitalic:
-        font.info.styleMapStyleName = "italic"
-      else:
-        font.info.styleMapStyleName = "regular"
-    else: # bold
-      if isitalic:
-        font.info.styleMapStyleName = "bold italic"
-      else:
-        font.info.styleMapStyleName = "bold"
-  else:
-    font.info.styleMapFamilyName = (family + ' ' + subfamily).strip()
-    # name ID 2 "Subfamily name" (legacy, but required)
-    if isitalic:
-      font.info.styleMapStyleName = "italic"
-    else:
-      font.info.styleMapStyleName = "regular"
+def collapseFontStyleName(font):
+  # collapse whitespace in style name. i.e. "Semi Bold Italic" -> "SemiBoldItalic"
+  font.info.styleName = re.sub(r'\s', '', font.info.styleName)
+  # update info to have style changes "trickle down" to other metadata
+  setFontInfo(font, font.info.openTypeOS2WeightClass)
 
 
 class Main(object):
@@ -333,6 +75,8 @@ class Main(object):
         compile-var  Build variable font files
         glyphsync    Generate designspace and UFOs from Glyphs file
         instancegen  Generate instance UFOs for designspace
+        checkfont    Verify integrity of font files
+        rename       Rename fonts
       '''.strip().replace('\n      ', '\n'))
 
     argparser.add_argument('-v', '--verbose', action='store_true',
@@ -358,7 +102,8 @@ class Main(object):
 
     # parse CLI arguments
     args = argparser.parse_args(argv[1:i])
-    logFormat = '%(funcName)s: %(message)s'
+
+    # log config
     if args.quiet:
       self.quiet = True
       if args.debug:
@@ -366,14 +111,13 @@ class Main(object):
       if args.verbose:
         fatal("--quiet and --verbose are mutually exclusive arguments")
     elif args.debug:
-      logging.basicConfig(level=logging.DEBUG, format=logFormat)
+      logging.basicConfig(level=logging.DEBUG, format='%(funcName)s: %(message)s')
       self.logLevelName = 'DEBUG'
     elif args.verbose:
-      logging.basicConfig(level=logging.INFO, format=logFormat)
+      logging.basicConfig(level=logging.INFO, format='%(funcName)s: %(message)s')
       self.logLevelName = 'INFO'
     else:
-      logFormat = '%(message)s'
-      logging.basicConfig(level=logging.WARNING, format=logFormat)
+      logging.basicConfig(level=logging.WARNING, format='%(message)s')
       self.logLevelName = 'WARNING'
 
     if args.chdir:
@@ -402,28 +146,17 @@ class Main(object):
     # decide output filename (or check user-provided name)
     outfilename = args.output
     if outfilename is None or outfilename == '':
-      outfilename = os.path.splitext(basename(args.srcfile))[0] + '.var.ttf'
-      log.info('setting --output %r' % outfilename)
-    else:
-      outfileext = os.path.splitext(outfilename)[1]
-      if outfileext.lower() != '.ttf':
-        fatal('Invalid file extension %r (expected ".ttf")' % outfileext)
+      outfilename = pjoin(
+        dirname(args.srcfile),
+        os.path.splitext(basename(args.srcfile))[0] + '.otf'
+      )
+      log.debug('setting --output %r' % outfilename)
 
     mkdirs(dirname(outfilename))
 
-    project = VarFontProject(verbose=self.logLevelName)
-    project.run_from_designspace(
-      args.srcfile,
-      interpolate=False,
-      masters_as_instances=False,
-      use_production_names=True,
-      round_instances=True,
-      output_path=outfilename,
-      output=['variable'],
-      overlaps_backend='pathops', # use Skia's pathops
-    )
-    self.log("write %s" % outfilename)
+    FontBuilder().buildVariable(args.srcfile, outfilename)
 
+    self.log("write %s" % outfilename)
     # Note: we can't run ots-sanitize on the generated file as OTS
     # currently doesn't support variable fonts.
 
@@ -438,96 +171,71 @@ class Main(object):
       help='Source file (.ufo file)')
 
     argparser.add_argument('-o', '--output', metavar='<fontfile>',
-      help='Output font file (.otf, .ttf or .ufo)')
+      help='Output font file (.otf or .ttf)')
 
     argparser.add_argument('--validate', action='store_true',
       help='Enable ufoLib validation on reading/writing UFO files')
 
     args = argparser.parse_args(argv)
 
-    ext_to_format = {
-      '.ufo': 'ufo',
-      '.otf': 'otf',
-      '.ttf': 'ttf',
-
-      # non-filename mapping targets: (kept for completeness)
-      # 'ttf-interpolatable',
-      # 'variable',
-    }
+    # write an OTF/CFF (or a TTF if false)
+    cff = True
 
     # decide output filename
     outfilename = args.output
     if outfilename is None or outfilename == '':
-      outfilename = os.path.splitext(basename(args.srcfile))[0] + '.otf'
-      log.info('setting --output %r' % outfilename)
-    
-    # build formats list from filename extension
-    formats = []
-    # for outfilename in args.outputs:
-    ext = os.path.splitext(outfilename)[1]
-    ext_lc = ext.lower()
-    if ext_lc in ext_to_format:
-      formats.append(ext_to_format[ext_lc])
+      outfilename = pjoin(
+        dirname(args.srcfile),
+        os.path.splitext(basename(args.srcfile))[0] + '.otf'
+      )
+      log.debug('setting --output %r' % outfilename)
     else:
-      fatal('Unsupported output format %s' % ext)
+      fext = os.path.splitext(outfilename)[1].lower()
+      if fext == ".ttf":
+        cff = False
+      elif fext != ".otf":
+        raise Exception('invalid file format %r (expected ".otf" or ".ttf")' % fext)
 
-    # temp file to write to
-    tmpfilename = pjoin(self.tmpdir, basename(outfilename))
-    mkdirs(self.tmpdir)
+    # build OTF or TTF file from UFO
+    FontBuilder().buildStatic(args.srcfile, outfilename, cff)
 
-    project = FontProject(verbose=self.logLevelName, validate_ufo=args.validate)
-
-    ufo = Font(args.srcfile)
-    updateFontVersion(ufo)
-
-    # if outfile is a ufo, simply move it to outfilename instead
-    # of running ots-sanitize.
-    output_path = tmpfilename
-    if formats[0] == 'ufo':
-      output_path = outfilename
-
-    # run fontmake to produce OTF/TTF file at tmpfilename
-    project.run_from_ufos(
-      [ ufo ],
-      output_path=output_path,
-      output=formats,
-      use_production_names=True,
-      optimize_cff=CFFOptimization.SUBROUTINIZE, # NONE
-      overlaps_backend='pathops', # use Skia's pathops
-      remove_overlaps=True,
-    )
-
-    if output_path == tmpfilename:
-      # Run ots-sanitize on produced OTF/TTF file and write sanitized version
-      # to outfilename
-      self._ots_sanitize(output_path, outfilename)
+    # code to pipe font through ots-sanitize:
+    # # temp file to write to
+    # tmpfilename = pjoin(self.tmpdir, basename(outfilename))
+    # mkdirs(self.tmpdir)
+    #
+    # # build OTF or TTF file from UFO
+    # FontBuilder().buildStatic(args.srcfile, tmpfilename, cff)
+    #
+    # # Run ots-sanitize on produced OTF/TTF file and write sanitized version to outfilename
+    # self._ots_sanitize(tmpfilename, outfilename)
 
 
-  def _ots_sanitize(self, tmpfilename, outfilename):
-    # run through ots-sanitize
-    # for filename in args.output:
-    tmpfile = pjoin(self.tmpdir, tmpfilename)
-    mkdirs(dirname(outfilename))
-    success = True
-    try:
-      self.log("write %s" % outfilename)
-      otssan_res = subprocess.check_output(
-        ['ots-sanitize', tmpfile, outfilename],
-        # ['cp', tmpfile, outfilename],
-        shell=False
-      ).strip()
-      # Note: ots-sanitize does not exit with an error in many cases where
-      # it fails to sanitize the font.
-      success = str(otssan_res).find('Failed') == -1
-    except:
-      success = False
-      if len(otssan_res) == 0:
-        otssan_res = 'error'
-    
-    if success:
-      os.unlink(tmpfile)
-    else:
-      fatal('ots-sanitize failed for %s: %s' % (tmpfile, otssan_res))
+  #def _ots_sanitize(self, tmpfilename, outfilename):
+  #  # run through ots-sanitize
+  #  # for filename in args.output:
+  #  tmpfile = pjoin(self.tmpdir, tmpfilename)
+  #  mkdirs(dirname(outfilename))
+  #  success = True
+  #  try:
+  #    self.log("write %s" % outfilename)
+  #    otssan_res = subprocess.check_output(
+  #      ['ots-sanitize', tmpfile, outfilename],
+  #      # ['cp', tmpfile, outfilename],
+  #      shell=False
+  #    ).strip()
+  #    # Note: ots-sanitize does not exit with an error in many cases where
+  #    # it fails to sanitize the font.
+  #    success = str(otssan_res).find('Failed') == -1
+  #  except:
+  #    success = False
+  #    if len(otssan_res) == 0:
+  #      otssan_res = 'error'
+  #
+  #  if success:
+  #    os.unlink(tmpfile)
+  #  else:
+  #    fatal('ots-sanitize failed for %s: %s' % (tmpfile, otssan_res))
 
 
 
@@ -554,16 +262,26 @@ class Main(object):
       if layer != defaultLayer:
         delLayerNames.add(layer.name)
     for layerName in delLayerNames:
-      del layers[layerName]
+      del(layers[layerName])
 
-    # clear anchors
+    # process glyphs
+    glyphOrder = OrderedDict([(k,None) for k in font.lib['public.glyphOrder']])
     for g in font:
-      g.clearAnchors()
-      del g.lib['com.schriftgestaltung.Glyphs.lastChange']
+      if not g.lib.get('com.schriftgestaltung.Glyphs.Export', True):
+        if g.name in glyphOrder:
+          del(glyphOrder[g.name])
+        g.unicodes = []
+      if EXCLUDE_ANCHORS:
+        g.clearAnchors()
+      if 'com.schriftgestaltung.Glyphs.lastChange' in g.lib:
+        del(g.lib['com.schriftgestaltung.Glyphs.lastChange'])
+
+    # update possibly modified glyphorder
+    font.lib['public.glyphOrder'] = list(glyphOrder)
 
     # write UFO file
     self.log("write %s" % relpath(ufo_path, os.getcwd()))
-    font.save(ufo_path)
+    font.save(ufo_path, overwrite=True, validate=False)
 
 
   def _genSubsetDesignSpace(self, designspace, tag, filename):
@@ -571,7 +289,7 @@ class Main(object):
     italic = False
     if tag == 'italic':
       italic = True
-    elif tag != 'upright':
+    elif tag != 'roman':
       raise Exception('unexpected tag ' + tag)
 
     for a in ds.axes:
@@ -626,10 +344,13 @@ class Main(object):
     if outdir is None:
       outdir = dirname(args.glyphsfile)
 
+    # TODO: Move into fontbuildlib
+
     # files
     master_dir = outdir
     glyphsfile = args.glyphsfile
-    designspace_file = pjoin(outdir, 'Inter.designspace')
+    name = os.path.splitext(basename(glyphsfile))[0]  # e.g. "Inter"
+    designspace_file = pjoin(outdir, name + '.designspace')
     instance_dir = pjoin(BASEDIR, 'build', 'ufo')
 
     # load glyphs project file
@@ -639,17 +360,33 @@ class Main(object):
     ))
     font = glyphsLib.GSFont(glyphsfile)
 
+    # remove archive layers and backgrounds
+    masterLayerIDs = set()
+    for master in font.masters:
+      masterLayerIDs.add(master.id)
+    for glyph in font.glyphs:
+      for layer in list(glyph.layers): # list to accumulate iterator since we del()
+        # remove background images from all layers
+        layer.backgroundImage = None
+        lname = layer.name
+        lid = layer.layerId
+        if lname[0] != '_' and (lid in masterLayerIDs or lname.find('{') != -1):
+          # Keep only layers which are masters or bracket layers.
+          # Next, clear background to speed up UFO generation.
+          layer.background.paths = []
+          layer.background.components = []
+          layer.background.anchors = []
+          layer.background.hints = []
+          layer.background.guides = []
+        else:
+          del(glyph.layers[lid])
+
     # generate designspace from glyphs project
     designspace = glyphsLib.to_designspace(
       font,
-      propagate_anchors=False,
+      propagate_anchors=(not EXCLUDE_ANCHORS),
       instance_dir=relpath(instance_dir, master_dir),
-
-      store_editor_state=False,
-      # do not store glyphs editor UI state in UFOs
-
-      minimize_glyphs_diffs=True,
-      # do not store glyphs metadata in UFOs
+      store_editor_state=False, # do not store glyphs editor UI state in UFOs
     )
 
     # strip lib data
@@ -659,8 +396,8 @@ class Main(object):
     # TODO: Only write out-of-date UFOs
     procs = []
     for source in designspace.sources:
-      # source : fontTools.designspaceLib.SourceDescriptor
-      # source.font : defcon.objects.font.Font
+      # source      : fontTools.designspaceLib.SourceDescriptor
+      # source.font : ufoLib2.objects.font.Font
       ufo_path = pjoin(master_dir, source.filename)
       # no need to also set the relative 'filename' attribute as that
       # will be auto-updated on writing the designspace document
@@ -668,27 +405,31 @@ class Main(object):
         # Workaround for Glyphs limitation
         # (Base italic master can't be called just Italic, so it's called
         # "Italic Italic" which is converted here to just "Italic")
-        ufo_path = pjoin(master_dir, 'Inter-Italic.ufo')
+        ufo_path = pjoin(master_dir, name + '-Italic.ufo')
         source.styleName = "Italic"
         source.name = "italic"
         source.font.info.styleName = source.styleName
       elif source.styleName == "Black Italic Italic":
-        ufo_path = pjoin(master_dir, 'Inter-BlackItalic.ufo')
+        ufo_path = pjoin(master_dir, name + '-BlackItalic.ufo')
         source.styleName = "Black Italic"
         source.name = "blackitalic"
         source.font.info.styleName = source.styleName
       elif source.styleName == "Thin Italic Italic":
-        ufo_path = pjoin(master_dir, 'Inter-ThinItalic.ufo')
+        ufo_path = pjoin(master_dir, name + '-ThinItalic.ufo')
         source.styleName = "Thin Italic"
         source.name = "thinitalic"
         source.font.info.styleName = source.styleName
       else:
         # name "Black" => "black"
         source.name = source.styleName.lower().replace(' ', '')
-      
+
       source.path = ufo_path
       weight = int(source.location['Weight'])
 
+      # serial
+      # self._glyphsyncWriteUFO(source.font, weight, ufo_path)
+
+      # parallel
       p = Process(
         target=self._glyphsyncWriteUFO,
         args=(source.font, weight, ufo_path)
@@ -704,17 +445,17 @@ class Main(object):
     self.log("write %s" % relpath(designspace_file, os.getcwd()))
     designspace.write(designspace_file)
 
-    # upright designspace
-    upright_designspace_file = pjoin(outdir, 'Inter-upright.designspace')
+    # roman designspace
+    roman_designspace_file = pjoin(outdir, name + '-roman.designspace')
     p = Process(
       target=self._genSubsetDesignSpace,
-      args=(designspace, 'upright', upright_designspace_file)
+      args=(designspace, 'roman', roman_designspace_file)
     )
     p.start()
     procs.append(p)
 
     # italic designspace
-    italic_designspace_file = pjoin(outdir, 'Inter-italic.designspace')
+    italic_designspace_file = pjoin(outdir, name + '-italic.designspace')
     p = Process(
       target=self._genSubsetDesignSpace,
       args=(designspace, 'italic', italic_designspace_file)
@@ -754,7 +495,7 @@ class Main(object):
       verbose=True
     )
 
-    designspace = designspaceLib.DesignSpaceDocument()
+    designspace = DesignSpaceDocument()
     designspace.read(designspace_file)
 
     # Generate UFOs for instances
@@ -787,17 +528,18 @@ class Main(object):
       italicAngle = font.lib.get(italicAngleKey)
       if italicAngle != None:
         italicAngle = float(italicAngle)
-        del font.lib[italicAngleKey]
+        del(font.lib[italicAngleKey])
         font.info.italicAngle = italicAngle
 
       # clear anchors
-      for g in font:
-        g.clearAnchors()
-      
+      if EXCLUDE_ANCHORS:
+        for g in font:
+          g.clearAnchors()
+
       # update font info
       weight = instance_weight[basename(font.path)]
       setFontInfo(font, weight)
-      
+
       font.save()
 
 
@@ -828,7 +570,7 @@ class Main(object):
 
     argparser.add_argument('files', metavar='<file>', nargs='+',
       help='Font files')
-    
+
     args = argparser.parse_args(argv)
     q = Queue()
 
@@ -846,6 +588,53 @@ class Main(object):
     for fontfile in args.files:
       if not q.get():
         sys.exit(1)
+
+
+  def cmd_rename(self, argv):
+    argparser = argparse.ArgumentParser(
+      usage='%(prog)s rename <options> <file>',
+      description='Rename family and/or styles of font'
+    )
+    a = lambda *args, **kwargs: argparser.add_argument(*args, **kwargs)
+
+    a('-o', '--output', metavar='<file>',
+      help='Output font file. Defaults to input file (overwrite.)')
+
+    a('--family', metavar='<name>',
+      help='Rename family to <name>')
+
+    a('--google-style', action='store_true',
+      help='Rename style names to Google Fonts standards.')
+
+    a('input', metavar='<file>',
+      help='Input font file')
+
+    args = argparser.parse_args(argv)
+
+    infile = args.input
+    outfile = args.output or infile
+
+    font = loadTTFont(infile)
+    editCount = 0
+    try:
+      if args.family:
+        editCount += 1
+        setFamilyName(font, args.family)
+
+      if args.google_style:
+        editCount += 1
+        renameStylesGoogleFonts(font)
+
+      if editCount == 0:
+        print("no rename options provided", file=sys.stderr)
+        argparser.print_help(sys.stderr)
+        sys.exit(1)
+        return
+
+      font.save(outfile)
+    finally:
+      font.close()
+
 
 
 if __name__ == '__main__':

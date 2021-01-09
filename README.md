@@ -11,7 +11,7 @@ tabular numbers, etc.
 
 [![Sample](docs/res/sample.png)](https://rsms.me/inter/samples/)
 
-### [⬇︎ Download the latest release](https://github.com/rsms/inter/releases)
+### [⬇︎ Download the latest release](https://github.com/rsms/inter/releases/latest)
 
 After downloading the zip from above:
 
@@ -19,6 +19,13 @@ After downloading the zip from above:
 2. Follow the instructions in "install-mac.txt" or "install-win.txt", depending
    on what operating system you're using.
 
+Font files are also available from the following third-party distributors:
+
+- [`inter-ui` on npm](https://www.npmjs.com/package/inter-ui)
+- [`font-inter` in Homebrew's Fonts cask](https://github.com/Homebrew/homebrew-cask-fonts)
+- See [Repology](https://repology.org/project/fonts:inter/versions) for a list of Linux distributions that include the font in their repositories.
+
+**Disclaimer:** Third-party packages may not always be up-to-date.
 
 ## Design
 
@@ -61,7 +68,7 @@ However, as the project progressed and the typeface was put into use, it quickly
 became clear that for anything longer than a short word, it was actually hard to
 read the almost monotonically-spaced letters.
 
-A second major revision was create where the previously-strict rule of geometry being even multiples of 256 was relaxed and now the rule is "try to stick with 128x, if you can't, stick with 64x and if you can't do that either, never go below 16x." This means that Inter is now much more variable in pace than it used to be, making it work better at higher resolutions and work much better in longer text, but losing some contrast and sharpness at small sizes.
+A second major revision was created where the previously-strict rule of geometry being even multiples of 256 was relaxed and now the rule is "try to stick with 128x, if you can't, stick with 64x and if you can't do that either, never go below 16x." This means that Inter is now much more variable in pace than it used to be, making it work better at higher resolutions and work much better in longer text, but losing some contrast and sharpness at small sizes.
 
 ![Metrics](docs/res/metrics.png)
 
@@ -84,8 +91,61 @@ Translating between EM units and pixels:
 There's a Figma workspace for glyphs, with configured metrics: ["Inter glyphs"](https://www.figma.com/file/RtScFU5NETY3j9E0yOmnW4gv/)
 
 
-## See also
+## Supporters
 
-- [Contributing](CONTRIBUTING.md)
-- [Compiling font files](CONTRIBUTING.md#compiling-font-files)
-- [SIL Open Font License](LICENSE.txt)
+A wholehearted **Thank You** to everyone who supports the Inter project!
+
+### Donors
+
+- @adrianmg
+- @artemc
+- @bapun26
+- @brianlovin
+- @chadlittle
+- @colinkeany
+- @danrowden
+- @davo
+- @emuravjev
+- @gbougakov
+- @jakejarvis
+- @lukesbeard
+- @lustfullyCake
+- @mamuso
+- @mbullington
+- @muuvmuuv
+- @NetOperatorWibby
+- @pedromvpg
+- @pmarsceill
+- @romashamin
+- @ruslangirichev
+- @saishmenon
+- @satyakresna
+- @sorentwo
+- @StandardResumeSponsors
+- @stpnkcrk
+- @taravancil
+- @usmanity
+- @zethussuen
+- Stefan Kempf
+
+_(Private donors excluded)_
+
+### Contributors
+
+- @thundernixon
+- @KatjaSchimmel
+- @kdrag0n
+- @gabrielizaias
+- @fractaledmind
+- @davelab6
+- @Veratyr
+- @Calinou
+
+
+## Development
+
+For instructions on how to work with the source files and how to
+[compile & build font files](CONTRIBUTING.md#compiling-font-files),
+refer to [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Inter is licensed under the [SIL Open Font License](LICENSE.txt)

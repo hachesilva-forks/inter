@@ -63,6 +63,7 @@ var HUDNotification = {
       return
     }
     n.visible = true
+    n.el.style.visibility = null
     clearTimeout(n.timer)
     n.timer = setTimeout(function(){ n.hide() }, duration || 1200)
   },
@@ -72,6 +73,7 @@ var HUDNotification = {
     if (n.visible) {
       n.el.classList.remove('visible')
       n.visible = false
+      n.el.style.visibility = 'hidden'
     }
   }
 }
@@ -94,7 +96,7 @@ function InterDynamicLineHeight(fontSize) {
 }
 
 
-// Mac or not? Maybe even a buggy Safari?
+// Mac or not? Maybe a buggy Safari or a busted Chrome on Windows...
 var isMac = false
 if (!window.MSStream &&
     /mac|ipad|iphone|ipod/i.test(navigator.userAgent))
@@ -105,4 +107,9 @@ if (!window.MSStream &&
   {
     document.body.classList.add('safari')
   }
+} else if (
+  navigator.userAgent.indexOf('Windows') != -1 &&
+  navigator.userAgent.indexOf('Chrome') != -1
+) {
+  document.body.classList.add('chrome-win')
 }

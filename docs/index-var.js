@@ -64,6 +64,10 @@ var ui = {
       if (unsupportedMessage) {
         unsupportedMessage.classList.add('active')
       }
+    } else {
+      this.state.size = window.innerWidth / 10
+      root.querySelector(`[name="size"]`).value = this.state.size
+      this.update()
     }
   },
 
@@ -90,7 +94,12 @@ var ui = {
     let s = sample.style
     for (let k in this.state) {
       let f = this.formatters[k]
-      s.setProperty(`--var-${k}`, f ? f(this.state[k]) : this.state[k])
+      let v = this.state[k]
+      if (k == "slant") {
+        // negate slant value (negative values causes positive grades)
+        v = -v
+      }
+      s.setProperty(`--var-${k}`, f ? f(v) : v)
     }
   },
 }
